@@ -55,7 +55,7 @@ struct _GUvLoopBackend {
   guint         life_state;
   gboolean      async_termination;
   gboolean      sources_ready;
-  gboolean      glib_iteration;
+  gboolean      dispatch_sources;
 };
 
 struct _GUvPollData {
@@ -71,7 +71,8 @@ static void     guv_context_set_context (gpointer backend_data,
 static void     guv_context_free        (gpointer backend_data);
 static gboolean guv_context_acquire     (gpointer backend_data);
 static gboolean guv_context_iterate     (gpointer backend_data,
-                                         gboolean block);
+                                         gboolean block,
+                                         gboolean dispatch);
 static gboolean guv_context_add_fd      (gpointer backend_data,
                                          gint     fd,
                                          gushort  events,
@@ -317,13 +318,10 @@ guv_check_cb (uv_check_t* handle, int status)
 
   backend->fds_ready = 0;
 
-  if (sources_ready)
-    {
-      if (backend->glib_iteration)
-        backend->sources_ready = TRUE;
-      else
-        g_main_context_dispatch (backend->context);
-    }
+  backend->sources_ready = sources_ready;
+
+  if (sources_ready && backend->dispatch_sources)
+    g_main_context_dispatch (backend->context);
 }
 
 static void
@@ -512,16 +510,17 @@ guv_context_acquire (gpointer backend_data)
 
 static gboolean
 guv_context_iterate (gpointer backend_data,
-                     gboolean block)
+                     gboolean block,
+                     gboolean dispatch)
 {
   GUvLoopBackend *backend = backend_data;
 
   backend->sources_ready = FALSE;
-  backend->glib_iteration = TRUE;
+  backend->dispatch_sources = dispatch;
 
   uv_run (backend->loop, block? UV_RUN_ONCE : UV_RUN_NOWAIT);
 
-  backend->glib_iteration = FALSE;
+  backend->dispatch_sources = TRUE;
 
   return backend->sources_ready;
 }
