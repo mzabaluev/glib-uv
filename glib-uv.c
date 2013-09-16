@@ -269,13 +269,10 @@ guv_pending_poll_update_walk (gpointer key, gpointer value, gpointer user_data)
 }
 
 static void
-guv_prepare_cb (uv_prepare_t* handle, int status)
+guv_context_sync_pending_changes (GUvLoopBackend *backend)
 {
-  GUvLoopBackend *backend = handle->data;
   GUvPollData *pd;
   GSList *item;
-
-  g_return_if_fail (status == 0);
 
   g_mutex_lock (&backend->mutex);
 
@@ -301,6 +298,16 @@ guv_prepare_cb (uv_prepare_t* handle, int status)
   g_hash_table_remove_all (backend->pending_poll_updates);
 
   g_mutex_unlock (&backend->mutex);
+}
+
+static void
+guv_prepare_cb (uv_prepare_t* handle, int status)
+{
+  GUvLoopBackend *backend = handle->data;
+
+  g_return_if_fail (status == 0);
+
+  guv_context_sync_pending_changes (backend);
 
   g_main_context_prepare (backend->context, &backend->max_priority);
 }
@@ -538,6 +545,8 @@ guv_context_add_fd (gpointer backend_data,
 
   if (backend->thread == g_thread_self ())
     {
+      guv_context_sync_pending_changes (backend);
+
       return guv_context_add_poll (backend, pd);
     }
   else
@@ -564,6 +573,8 @@ guv_context_remove_fd (gpointer backend_data,
 
   if (backend->thread == g_thread_self ())
     {
+      guv_context_sync_pending_changes (backend);
+
       pd = g_hash_table_lookup (backend->poll_records, GINT_TO_POINTER (fd));
       g_return_val_if_fail (pd != NULL, FALSE);
 
@@ -583,6 +594,9 @@ guv_context_remove_fd (gpointer backend_data,
   else
     {
       g_mutex_lock (&backend->mutex);
+
+      g_hash_table_remove (backend->pending_poll_updates,
+          GINT_TO_POINTER (fd));
 
       pd = g_hash_table_lookup (backend->pending_poll_records,
           GINT_TO_POINTER (fd));
@@ -623,26 +637,20 @@ guv_context_modify_fd   (gpointer backend_data,
 
   if (backend->thread == g_thread_self ())
     {
+      guv_context_sync_pending_changes (backend);
+
       pd = g_hash_table_lookup (backend->poll_records, GINT_TO_POINTER (fd));
 
-      if (pd != NULL)
-        {
-          status = uv_poll_start (&pd->poll, guv_events_glib_to_uv (pd->events),
-              guv_poll_cb);
-
-          if (G_UNLIKELY (status != 0))
-            {
-              WARN_UV_LAST_ERROR ("uv_poll_start failed", backend->loop);
-              return FALSE;
-            }
-        }
-      else
-        {
-          pd = g_hash_table_lookup (backend->pending_poll_records,
-                  GINT_TO_POINTER (fd));
-        }
-
       g_return_val_if_fail (pd != NULL, FALSE);
+
+      status = uv_poll_start (&pd->poll, guv_events_glib_to_uv (pd->events),
+          guv_poll_cb);
+
+      if (G_UNLIKELY (status != 0))
+        {
+          WARN_UV_LAST_ERROR ("uv_poll_start failed", backend->loop);
+          return FALSE;
+        }
 
       pd->events = events;
     }
