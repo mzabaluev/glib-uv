@@ -352,7 +352,7 @@ guv_context_gc(GUvLoopBackend *backend)
 }
 
 static void
-guv_context_async_closed (uv_handle_t *handle)
+guv_async_closed (uv_handle_t *handle)
 {
   GUvLoopBackend *backend = handle->data;
 
@@ -362,7 +362,7 @@ guv_context_async_closed (uv_handle_t *handle)
 }
 
 static void
-guv_context_prepare_closed (uv_handle_t *handle)
+guv_prepare_closed (uv_handle_t *handle)
 {
   GUvLoopBackend *backend = handle->data;
 
@@ -372,7 +372,7 @@ guv_context_prepare_closed (uv_handle_t *handle)
 }
 
 static void
-guv_context_check_closed (uv_handle_t *handle)
+guv_check_closed (uv_handle_t *handle)
 {
   GUvLoopBackend *backend = handle->data;
 
@@ -450,11 +450,11 @@ uv_init_cleanup:
   if (!guv_context_gc (backend))
     {
       if ((backend->life_state & GUV_LIVE_ASYNC) != 0)
-        uv_close ((uv_handle_t *) &backend->async, guv_context_async_closed);
+        uv_close ((uv_handle_t *) &backend->async, guv_async_closed);
       if ((backend->life_state & GUV_LIVE_PREPARE) != 0)
-        uv_close ((uv_handle_t *) &backend->prepare, guv_context_prepare_closed);
+        uv_close ((uv_handle_t *) &backend->prepare, guv_prepare_closed);
       if ((backend->life_state & GUV_LIVE_CHECK) != 0)
-        uv_close ((uv_handle_t *) &backend->check, guv_context_check_closed);
+        uv_close ((uv_handle_t *) &backend->check, guv_check_closed);
     }
 
   return NULL;
@@ -477,7 +477,7 @@ guv_context_free (gpointer backend_data)
 
   if (backend->thread != g_thread_self ())
     {
-      g_return_if_fail (!backend->async_termination);
+      g_assert (!backend->async_termination);
 
       backend->async_termination = TRUE;
 
@@ -488,9 +488,9 @@ guv_context_free (gpointer backend_data)
 
   backend->async_termination = FALSE;
 
-  uv_close ((uv_handle_t *) &backend->async, guv_context_async_closed);
-  uv_close ((uv_handle_t *) &backend->prepare, guv_context_prepare_closed);
-  uv_close ((uv_handle_t *) &backend->check, guv_context_check_closed);
+  uv_close ((uv_handle_t *) &backend->async, guv_async_closed);
+  uv_close ((uv_handle_t *) &backend->prepare, guv_prepare_closed);
+  uv_close ((uv_handle_t *) &backend->check, guv_check_closed);
 
   g_slist_free (backend->remove_list);
 
