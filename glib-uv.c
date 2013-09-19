@@ -71,8 +71,9 @@ struct _GUvPollData {
   gboolean        watched;
   gint            fd;
   gushort         events;
-  GUvLoopBackend *backend;
 };
+
+#define GUV_POLL_DATA(uvp) ((GUvPollData *) ((char *) (uvp) - G_STRUCT_OFFSET (GUvPollData, poll)))
 
 static gpointer guv_context_create      (gpointer user_data);
 static void     guv_context_set_context (gpointer backend_data,
@@ -161,11 +162,10 @@ guv_poll_new (int fd, gushort events, GUvLoopBackend *backend)
   GUvPollData *pd;
 
   pd = g_slice_new (GUvPollData);
-  pd->poll.data = pd;
+  pd->poll.data = backend;
   pd->watched = FALSE;
   pd->fd = fd;
   pd->events = events;
-  pd->backend = backend;
 
   return pd;
 }
@@ -174,7 +174,7 @@ static void
 guv_poll_closed (uv_handle_t *handle)
 {
   /* The poll structure is a member of GUvPollData */
-  g_slice_free (GUvPollData, handle->data);
+  g_slice_free (GUvPollData, GUV_POLL_DATA (handle));
 }
 
 static void
@@ -184,7 +184,7 @@ guv_poll_close (GUvPollData *pd)
     uv_close ((uv_handle_t *) &pd->poll, guv_poll_closed);
   else
     {
-      GUvLoopBackend *backend = pd->backend;
+      GUvLoopBackend *backend = pd->poll.data;
 
       g_assert (backend->fds_prepoll > 0);
 
@@ -220,8 +220,8 @@ guv_context_ensure_poll_array_size (GUvLoopBackend *backend, guint required)
 static void
 guv_poll_cb (uv_poll_t* handle, int status, int events)
 {
-  GUvPollData *pd = handle->data;
-  GUvLoopBackend *backend = pd->backend;
+  GUvPollData *pd = GUV_POLL_DATA (handle);
+  GUvLoopBackend *backend = handle->data;
   GPollFD *pollfd;
 
   guv_context_ensure_poll_array_size (backend, backend->fds_ready + 1);
