@@ -31,9 +31,10 @@ typedef struct _GUvPollData GUvPollData;
 typedef enum
 {
   GUV_LIVE_ASYNC   = 1 << 0,
-  GUV_LIVE_PREPARE = 1 << 1,
-  GUV_LIVE_CHECK   = 1 << 2,
-  GUV_LIVE_ALL     = (1 << 3) - 1
+  GUV_LIVE_TIMER   = 1 << 1,
+  GUV_LIVE_PREPARE = 1 << 2,
+  GUV_LIVE_CHECK   = 1 << 3,
+  GUV_LIVE_ALL     = (1 << 4) - 1
 } GUvLifeFlags;
 
 struct _GUvLoopBackend {
@@ -46,6 +47,7 @@ struct _GUvLoopBackend {
   GHashTable   *poll_records;           /* map<fd, GUvPollData*> */
   GThread      *thread;
   uv_async_t    async;
+  uv_timer_t    timer;
   uv_prepare_t  prepare;
   uv_check_t    check;
   guint         life_state;
@@ -207,13 +209,23 @@ guv_poll_cb (uv_poll_t* handle, int status, int events)
 }
 
 static void
+guv_timer_cb (uv_timer_t *timer, int status)
+{
+}
+
+static void
 guv_prepare_cb (uv_prepare_t* handle, int status)
 {
   GUvLoopBackend *backend = handle->data;
+  gint timeout;
 
   g_return_if_fail (status == 0);
 
   g_main_context_prepare (backend->context, &backend->max_priority);
+
+  timeout = g_main_context_get_poll_timeout (backend->context);
+  if (timeout >= 0)
+    uv_timer_start (&backend->timer, guv_timer_cb, timeout, 0);
 
   backend->fds_ready = 0;
 }
@@ -266,6 +278,16 @@ guv_async_closed (uv_handle_t *handle)
 }
 
 static void
+guv_timer_closed (uv_handle_t *handle)
+{
+  GUvLoopBackend *backend = handle->data;
+
+  backend->life_state &= ~GUV_LIVE_TIMER;
+
+  guv_context_gc (backend);
+}
+
+static void
 guv_prepare_closed (uv_handle_t *handle)
 {
   GUvLoopBackend *backend = handle->data;
@@ -302,6 +324,15 @@ static gpointer guv_context_create (gpointer user_data)
     }
   backend->async.data = backend;
   backend->life_state |= GUV_LIVE_ASYNC;
+
+  status = uv_timer_init (backend->loop, &backend->timer);
+  if (G_UNLIKELY (status != 0))
+    {
+      WARN_UV_LAST_ERROR("uv_prepare_init failed", backend->loop);
+      goto uv_init_cleanup;
+    }
+  backend->timer.data = backend;
+  backend->life_state |= GUV_LIVE_TIMER;
 
   status = uv_prepare_init (backend->loop, &backend->prepare);
   if (G_UNLIKELY (status != 0))
@@ -340,6 +371,8 @@ static gpointer guv_context_create (gpointer user_data)
   backend->poll_records = g_hash_table_new_full (g_direct_hash, g_direct_equal,
       NULL, (GDestroyNotify) guv_poll_close);
 
+  backend->dispatch_sources = TRUE;
+
   return backend;
 
 uv_init_cleanup:
@@ -348,6 +381,8 @@ uv_init_cleanup:
     {
       if ((backend->life_state & GUV_LIVE_ASYNC) != 0)
         uv_close ((uv_handle_t *) &backend->async, guv_async_closed);
+      if ((backend->life_state & GUV_LIVE_TIMER) != 0)
+        uv_close ((uv_handle_t *) &backend->timer, guv_timer_closed);
       if ((backend->life_state & GUV_LIVE_PREPARE) != 0)
         uv_close ((uv_handle_t *) &backend->prepare, guv_prepare_closed);
       if ((backend->life_state & GUV_LIVE_CHECK) != 0)
@@ -386,6 +421,7 @@ guv_context_free (gpointer backend_data)
   backend->async_termination = FALSE;
 
   uv_close ((uv_handle_t *) &backend->async, guv_async_closed);
+  uv_close ((uv_handle_t *) &backend->timer, guv_timer_closed);
   uv_close ((uv_handle_t *) &backend->prepare, guv_prepare_closed);
   uv_close ((uv_handle_t *) &backend->check, guv_check_closed);
 
