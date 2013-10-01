@@ -51,9 +51,10 @@ struct _GUvLoopBackend {
   uv_prepare_t  prepare;
   uv_check_t    check;
   guint         life_state;
-  gboolean      async_termination;
-  gboolean      sources_ready;
-  gboolean      dispatch_sources;
+  guint         dispatch_sources  :1;
+  guint         context_acquired  :1;
+  guint         sources_ready     :1;
+  guint         async_termination :1;
 };
 
 struct _GUvPollData {
@@ -213,6 +214,8 @@ guv_timer_cb (uv_timer_t *timer, int status)
 {
 }
 
+static void guv_check_cb (uv_check_t* handle, int status);
+
 static void
 guv_prepare_cb (uv_prepare_t* handle, int status)
 {
@@ -220,6 +223,18 @@ guv_prepare_cb (uv_prepare_t* handle, int status)
   gint timeout;
 
   g_return_if_fail (status == 0);
+
+  backend->context_acquired = g_main_context_acquire (backend->context);
+
+  g_return_if_fail (backend->context_acquired);
+
+  status = uv_check_start (&backend->check, guv_check_cb);
+  if (G_UNLIKELY (status != 0))
+    {
+      WARN_UV_LAST_ERROR("uv_check_start failed", backend->loop);
+      g_main_context_release (backend->context);
+      return;
+    }
 
   g_main_context_prepare (backend->context, &backend->max_priority);
 
@@ -234,17 +249,19 @@ static void
 guv_check_cb (uv_check_t* handle, int status)
 {
   GUvLoopBackend *backend = handle->data;
-  gboolean sources_ready;
 
   g_return_if_fail (status == 0);
 
-  sources_ready = g_main_context_check (backend->context, backend->max_priority,
-      backend->fds, backend->fds_ready);
+  g_assert (backend->context_acquired);
 
-  backend->sources_ready = sources_ready;
+  backend->sources_ready = g_main_context_check (backend->context,
+      backend->max_priority, backend->fds, backend->fds_ready);
 
-  if (sources_ready && backend->dispatch_sources)
+  if (backend->sources_ready && backend->dispatch_sources)
     g_main_context_dispatch (backend->context);
+
+  g_main_context_release (backend->context);
+  backend->context_acquired = FALSE;
 }
 
 static void
@@ -356,13 +373,6 @@ static gpointer guv_context_create (gpointer user_data)
   if (G_UNLIKELY (status != 0))
     {
       WARN_UV_LAST_ERROR("uv_prepare_start failed", backend->loop);
-      goto uv_init_cleanup;
-    }
-
-  status = uv_check_start (&backend->check, guv_check_cb);
-  if (G_UNLIKELY (status != 0))
-    {
-      WARN_UV_LAST_ERROR("uv_check_start failed", backend->loop);
       goto uv_init_cleanup;
     }
 
