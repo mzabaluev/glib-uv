@@ -24,6 +24,8 @@
 #include <glib.h>
 #include <uv.h>
 
-GMainContext * guv_main_context_new (uv_loop_t *loop);
+GMainContext * guv_main_context_new (void);
+gboolean guv_main_context_start (GMainContext *context, uv_loop_t *loop);
+void     guv_main_context_stop  (GMainContext *context);
 
 #endif /* GLIB_UV_H_ */

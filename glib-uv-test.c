@@ -53,12 +53,15 @@ test_uvcontext_basic (void)
   uv_loop_t *loop;
   GMainContext *ctx;
 
+  ctx = guv_main_context_new ();
   loop = uv_loop_new ();
-  ctx = guv_main_context_new (loop);
+
+  guv_main_context_start (ctx, loop);
 
   g_assert (!g_main_context_pending (ctx));
   g_assert (!g_main_context_iteration (ctx, FALSE));
 
+  guv_main_context_stop (ctx);
   g_main_context_unref (ctx);
 
   uv_run (loop, UV_RUN_DEFAULT);
@@ -80,10 +83,10 @@ count_calls (gpointer data)
 }
 
 static gboolean
-quit_loop (gpointer data)
+stop_context (gpointer data)
 {
-  uv_stop ((uv_loop_t *) data);
-  return FALSE;
+  guv_main_context_stop ((GMainContext *) data);
+  return G_SOURCE_REMOVE;
 }
 
 static void
@@ -95,8 +98,7 @@ test_timeouts (void)
 
   a = b = c = 0;
 
-  loop = uv_loop_new ();
-  ctx = guv_main_context_new (loop);
+  ctx = guv_main_context_new ();
 
   source = g_timeout_source_new (100);
   g_source_set_callback (source, count_calls, &a, NULL);
@@ -114,10 +116,12 @@ test_timeouts (void)
   g_source_unref (source);
 
   source = g_timeout_source_new (1050);
-  g_source_set_callback (source, quit_loop, loop, NULL);
+  g_source_set_callback (source, stop_context, ctx, NULL);
   g_source_attach (source, ctx);
   g_source_unref (source);
 
+  loop = uv_loop_new ();
+  guv_main_context_start (ctx, loop);
   uv_run (loop, UV_RUN_DEFAULT);
 
   /* We may be delayed for an arbitrary amount of time - for example,
@@ -131,10 +135,8 @@ test_timeouts (void)
   g_assert_cmpint (b, <=, 4);
   g_assert_cmpint (c, <=, 3);
 
-  g_main_context_unref (ctx);
-  /* Run the loop again to complete closing of the handles */
-  uv_run (loop, UV_RUN_DEFAULT);
   uv_loop_delete (loop);
+  g_main_context_unref (ctx);
 }
 
 int
