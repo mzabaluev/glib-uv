@@ -139,6 +139,82 @@ test_timeouts (void)
   g_main_context_unref (ctx);
 }
 
+static gint count;
+
+static gboolean
+func (gpointer data)
+{
+  if (data != NULL)
+    g_assert (data == g_thread_self ());
+
+  count++;
+
+  return FALSE;
+}
+
+static GMutex mutex;
+static GCond cond;
+static volatile gboolean thread_ready;
+
+static gpointer
+thread_func (gpointer data)
+{
+  GMainContext *ctx = data;
+  uv_loop_t *loop;
+  GSource *source;
+
+  g_main_context_push_thread_default (ctx);
+
+  loop = uv_loop_new ();
+  guv_main_context_start (ctx, loop);
+
+  g_mutex_lock (&mutex);
+  thread_ready = TRUE;
+  g_cond_signal (&cond);
+  g_mutex_unlock (&mutex);
+
+  source = g_timeout_source_new (500);
+  g_source_set_callback (source, stop_context, ctx, NULL);
+  g_source_attach (source, ctx);
+  g_source_unref (source);
+
+  uv_run (loop, UV_RUN_DEFAULT);
+  uv_loop_delete (loop);
+
+  g_main_context_pop_thread_default (ctx);
+
+  return NULL;
+}
+
+static void
+test_invoke (void)
+{
+  GMainContext *ctx;
+  GThread *thread;
+
+  ctx = guv_main_context_new ();
+
+  count = 0;
+
+  /* test thread-default forcing the invocation to go
+   * to another thread
+   */
+  thread = g_thread_new ("worker", thread_func, ctx);
+
+  g_mutex_lock (&mutex);
+  while (!thread_ready)
+    g_cond_wait (&cond, &mutex);
+  g_mutex_unlock (&mutex);
+
+  g_main_context_invoke (ctx, func, thread);
+  g_main_context_invoke (ctx, func, thread);
+
+  g_thread_join (thread);
+  g_assert_cmpint (count, ==, 2);
+
+  g_main_context_unref (ctx);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -146,6 +222,7 @@ main (int argc, char *argv[])
 
   g_test_add_func ("/basic", test_uvcontext_basic);
   g_test_add_func ("/timeouts", test_timeouts);
+  g_test_add_func ("/invoke", test_invoke);
 
   return g_test_run ();
 }
