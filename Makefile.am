@@ -1,6 +1,7 @@
 ACLOCAL_AMFLAGS = -I m4
 
 AM_CPPFLAGS = $(GLIB_CFLAGS) $(UV_CFLAGS)
+AM_CFLAGS = -Wall -Werror
 
 lib_LTLIBRARIES = libglib-uv.la
 
