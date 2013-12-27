@@ -52,16 +52,17 @@ test_uvcontext_basic (void)
 {
   uv_loop_t *loop;
   GMainContext *ctx;
+  gpointer poller;
 
-  ctx = guv_main_context_new ();
+  ctx = g_main_context_new ();
   loop = uv_loop_new ();
 
-  guv_main_context_start (ctx, loop);
+  poller = guv_main_context_start (ctx, loop);
 
   g_assert (!g_main_context_pending (ctx));
   g_assert (!g_main_context_iteration (ctx, FALSE));
 
-  guv_main_context_stop (ctx);
+  g_main_context_leave_poller (ctx, poller);
   g_main_context_unref (ctx);
 
   uv_run (loop, UV_RUN_DEFAULT);
@@ -82,10 +83,17 @@ count_calls (gpointer data)
   return TRUE;
 }
 
+typedef struct _StopContextData
+{
+  GMainContext *context;
+  gpointer      poller;
+} StopContextData;
+
 static gboolean
 stop_context (gpointer data)
 {
-  guv_main_context_stop ((GMainContext *) data);
+  StopContextData *d = data;
+  g_main_context_leave_poller (d->context, d->poller);
   return G_SOURCE_REMOVE;
 }
 
@@ -95,10 +103,14 @@ test_timeouts (void)
   uv_loop_t *loop;
   GMainContext *ctx;
   GSource *source;
+  StopContextData leave_data;
 
   a = b = c = 0;
 
-  ctx = guv_main_context_new ();
+  ctx = g_main_context_new ();
+  loop = uv_loop_new ();
+  leave_data.context = ctx;
+  leave_data.poller = guv_main_context_start (ctx, loop);
 
   source = g_timeout_source_new (100);
   g_source_set_callback (source, count_calls, &a, NULL);
@@ -116,12 +128,10 @@ test_timeouts (void)
   g_source_unref (source);
 
   source = g_timeout_source_new (1050);
-  g_source_set_callback (source, stop_context, ctx, NULL);
+  g_source_set_callback (source, stop_context, &leave_data, NULL);
   g_source_attach (source, ctx);
   g_source_unref (source);
 
-  loop = uv_loop_new ();
-  guv_main_context_start (ctx, loop);
   uv_run (loop, UV_RUN_DEFAULT);
 
   /* We may be delayed for an arbitrary amount of time - for example,
@@ -162,11 +172,13 @@ thread_func (gpointer data)
   GMainContext *ctx = data;
   uv_loop_t *loop;
   GSource *source;
+  StopContextData leave_data;
 
   g_main_context_push_thread_default (ctx);
 
   loop = uv_loop_new ();
-  guv_main_context_start (ctx, loop);
+  leave_data.context = ctx;
+  leave_data.poller = guv_main_context_start (ctx, loop);
 
   g_mutex_lock (&mutex);
   thread_ready = TRUE;
@@ -174,7 +186,7 @@ thread_func (gpointer data)
   g_mutex_unlock (&mutex);
 
   source = g_timeout_source_new (500);
-  g_source_set_callback (source, stop_context, ctx, NULL);
+  g_source_set_callback (source, stop_context, &leave_data, NULL);
   g_source_attach (source, ctx);
   g_source_unref (source);
 
@@ -192,7 +204,7 @@ test_invoke (void)
   GMainContext *ctx;
   GThread *thread;
 
-  ctx = guv_main_context_new ();
+  ctx = g_main_context_new ();
 
   count = 0;
 

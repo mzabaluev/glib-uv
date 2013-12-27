@@ -18,25 +18,24 @@
  * Boston, MA 02111-1307, USA.
  */
 
-#define G_LOG_DOMAIN "GLib-Uv"
+#define G_LOG_DOMAIN "GLib-uv"
 
 #include "glib-uv.h"
 
 #define WARN_UV_LAST_ERROR(message, loop) \
     g_warning (message ": %s", uv_strerror (uv_last_error (loop)))
 
-typedef struct _GUvLoopBackend GUvLoopBackend;
-typedef struct _GUvPollData GUvPollData;
+typedef struct _GuvPollerBackend GuvPollerBackend;
+typedef struct _GuvPollData GuvPollData;
 
-struct _GUvLoopBackend {
+struct _GuvPollerBackend {
   GMainContext *context;
   uv_loop_t    *loop;
   GPollFD      *fds;
   guint         fds_size;
   guint         fds_ready;
   gint          max_priority;
-  GHashTable   *poll_records;           /* map<fd, GUvPollData*> */
-  GThread      *thread;
+  GHashTable   *poll_records;           /* map<fd, GuvPollData*> */
   uv_timer_t   *timer;
   uv_prepare_t *prepare;
   uv_check_t   *check;
@@ -50,52 +49,41 @@ typedef enum
   GUV_POLL_IN_LOOP    = 2,
 } GUvPollGCFlags;
 
-struct _GUvPollData {
+struct _GuvPollData {
   uv_poll_t       poll;
   gint            fd;
   gushort         events;
   gushort         gc_flags;
 };
 
-#define GUV_POLL_DATA(uvp) ((GUvPollData *) ((char *) (uvp) - G_STRUCT_OFFSET (GUvPollData, poll)))
+#define GUV_POLL_DATA(uvp) ((GuvPollData *) ((char *) (uvp) - G_STRUCT_OFFSET (GuvPollData, poll)))
 
-static gpointer guv_context_create      (gpointer user_data);
-static void     guv_context_set_context (gpointer backend_data,
-                                         GMainContext *context);
-static void     guv_context_free        (gpointer backend_data);
-static gboolean guv_context_acquire     (gpointer backend_data);
-static gboolean guv_context_iterate     (gpointer backend_data,
-                                         gboolean block,
-                                         gboolean dispatch);
-static gboolean guv_context_add_fd      (gpointer backend_data,
+static void     guv_poller_destroy (gpointer backend_data);
+static gboolean guv_poller_add_fd      (gpointer backend_data,
                                          gint     fd,
                                          gushort  events,
                                          gint     priority);
-static gboolean guv_context_modify_fd   (gpointer backend_data,
+static gboolean guv_poller_modify_fd   (gpointer backend_data,
                                          gint     fd,
                                          gushort  events,
                                          gint     priority);
-static gboolean guv_context_remove_fd   (gpointer backend_data,
+static gboolean guv_poller_remove_fd   (gpointer backend_data,
                                          gint     fd);
+static void     guv_poller_reset   (gpointer backend_data);
+static gboolean guv_poller_iterate (gpointer backend_data,
+                                     GMainContext *context,
+                                     gboolean block,
+                                     gboolean dispatch);
 
-static const GMainContextFuncs guv_main_context_funcs =
+static const GPollerFuncs guv_poller_funcs =
 {
-  guv_context_create,
-  guv_context_set_context,
-  guv_context_free,
-  guv_context_acquire,
-  NULL, /* release */
-  guv_context_iterate,
-  guv_context_add_fd,
-  guv_context_modify_fd,
-  guv_context_remove_fd,
+  guv_poller_destroy,
+  guv_poller_add_fd,
+  guv_poller_modify_fd,
+  guv_poller_remove_fd,
+  guv_poller_reset,
+  guv_poller_iterate,
 };
-
-GMainContext *
-guv_main_context_new (void)
-{
-  return g_main_context_new_custom (&guv_main_context_funcs, NULL);
-}
 
 static inline guint
 guv_direct_event_mask ()
@@ -140,12 +128,12 @@ guv_events_uv_to_glib (int uv_events)
   return events;
 }
 
-static GUvPollData *
-guv_poll_new (int fd, gushort events, GUvLoopBackend *backend)
+static GuvPollData *
+guv_poll_new (int fd, gushort events, GuvPollerBackend *backend)
 {
-  GUvPollData *pd;
+  GuvPollData *pd;
 
-  pd = g_slice_new (GUvPollData);
+  pd = g_slice_new (GuvPollData);
   pd->poll.data = backend;
   pd->fd = fd;
   pd->events = events;
@@ -155,24 +143,24 @@ guv_poll_new (int fd, gushort events, GUvLoopBackend *backend)
 }
 
 static void
-guv_poll_remove_record (GUvPollData *pd)
+guv_poll_remove_record (GuvPollData *pd)
 {
   pd->gc_flags &= ~GUV_POLL_IN_CONTEXT;
   if (pd->gc_flags == 0)
-    g_slice_free (GUvPollData, pd);
+    g_slice_free (GuvPollData, pd);
 }
 
 static void
 guv_poll_closed (uv_handle_t *handle)
 {
-  GUvPollData *pd = GUV_POLL_DATA (handle);
+  GuvPollData *pd = GUV_POLL_DATA (handle);
   pd->gc_flags &= ~GUV_POLL_IN_LOOP;
   if (pd->gc_flags == 0)
-    g_slice_free (GUvPollData, pd);
+    g_slice_free (GuvPollData, pd);
 }
 
 static void
-guv_context_ensure_poll_array_size (GUvLoopBackend *backend, guint required)
+guv_poller_ensure_poll_array_size (GuvPollerBackend *backend, guint required)
 {
   guint new_fds_size;
   guint poll_size;
@@ -192,11 +180,11 @@ guv_context_ensure_poll_array_size (GUvLoopBackend *backend, guint required)
 static void
 guv_poll_cb (uv_poll_t* handle, int status, int events)
 {
-  GUvPollData *pd = GUV_POLL_DATA (handle);
-  GUvLoopBackend *backend = handle->data;
+  GuvPollData *pd = GUV_POLL_DATA (handle);
+  GuvPollerBackend *backend = handle->data;
   GPollFD *pollfd;
 
-  guv_context_ensure_poll_array_size (backend, backend->fds_ready + 1);
+  guv_poller_ensure_poll_array_size (backend, backend->fds_ready + 1);
 
   pollfd = &backend->fds[backend->fds_ready++];
   pollfd->fd = pd->fd;
@@ -209,7 +197,7 @@ guv_poll_cb (uv_poll_t* handle, int status, int events)
 }
 
 static void
-guv_poll_start (GUvPollData *pd, uv_loop_t *loop)
+guv_poll_start (GuvPollData *pd, uv_loop_t *loop)
 {
   int status;
 
@@ -236,7 +224,7 @@ guv_poll_start (GUvPollData *pd, uv_loop_t *loop)
 }
 
 static void
-guv_poll_stop (GUvPollData *pd, uv_loop_t *loop)
+guv_poll_stop (GuvPollData *pd, uv_loop_t *loop)
 {
   int status;
 
@@ -249,7 +237,7 @@ guv_poll_stop (GUvPollData *pd, uv_loop_t *loop)
 }
 
 static void
-guv_poll_update (GUvPollData *pd, gushort events, uv_loop_t *loop)
+guv_poll_update (GuvPollData *pd, gushort events, uv_loop_t *loop)
 {
   int status;
 
@@ -273,146 +261,113 @@ guv_timer_cb (uv_timer_t *timer, int status)
 static void
 guv_prepare_cb (uv_prepare_t* handle, int status)
 {
-  GUvLoopBackend *backend = handle->data;
+  GuvPollerBackend *backend = handle->data;
   gint timeout;
-  gboolean acquired;
 
   g_return_if_fail (status == 0);
 
-  /* Temporarily hold another owner reference
-   * in case guv_main_context_stop is called in a prepare callback.
-   */
-  acquired = g_main_context_acquire (backend->context);
-
-  g_return_if_fail (acquired);
-
   g_main_context_prepare (backend->context, &backend->max_priority);
 
-  if (G_LIKELY (backend->timer != NULL))
-    {
-      timeout = g_main_context_get_poll_timeout (backend->context);
-      if (timeout >= 0)
-        uv_timer_start (&backend->timer, guv_timer_cb, timeout, 0);
-    }
+  g_assert (backend->timer != NULL);
+
+  timeout = g_main_context_get_timeout (backend->context);
+  if (timeout >= 0)
+    uv_timer_start (backend->timer, guv_timer_cb, timeout, 0);
 
   backend->fds_ready = 0;
-
-  g_main_context_release (backend->context);
 }
 
 static void
 guv_check_cb (uv_check_t* handle, int status)
 {
-  GUvLoopBackend *backend = handle->data;
-  gboolean acquired;
+  GuvPollerBackend *backend = handle->data;
 
   g_return_if_fail (status == 0);
 
-  /* Temporarily hold another owner reference
-   * in case guv_main_context_stop is called in a check or dispatch callback.
-   */
-  acquired = g_main_context_acquire (backend->context);
-
-  g_return_if_fail (acquired);
+  uv_timer_stop (backend->timer);
 
   backend->sources_ready = g_main_context_check (backend->context,
       backend->max_priority, backend->fds, backend->fds_ready);
 
   if (backend->sources_ready && backend->dispatch_sources)
     g_main_context_dispatch (backend->context);
-
-  g_main_context_release (backend->context);
 }
 
 static void
 guv_timer_closed (uv_handle_t *handle)
 {
-  g_slice_free (uv_timer_t, handle);
+  g_slice_free (uv_timer_t, (uv_timer_t *) handle);
 }
 
 static void
 guv_prepare_closed (uv_handle_t *handle)
 {
-  g_slice_free (uv_prepare_t, handle);
+  g_slice_free (uv_prepare_t, (uv_prepare_t *) handle);
 }
 
 static void
 guv_check_closed (uv_handle_t *handle)
 {
-  g_slice_free (uv_check_t, handle);
-}
-
-static void
-guv_poll_start_walk (gpointer key, gpointer value, gpointer user_data)
-{
-  GUvPollData *pd = value;
-  uv_loop_t *loop = user_data;
-
-  guv_poll_start (pd, loop);
+  g_slice_free (uv_check_t, (uv_check_t *) handle);
 }
 
 static void
 guv_poll_stop_walk (gpointer key, gpointer value, gpointer user_data)
 {
-  GUvPollData *pd = value;
+  GuvPollData *pd = value;
   uv_loop_t *loop = user_data;
 
   guv_poll_stop (pd, loop);
 }
 
-gboolean
+gpointer
 guv_main_context_start (GMainContext *context, uv_loop_t *loop)
 {
-  GUvLoopBackend *backend;
-  uv_timer_t *timer;
-  uv_prepare_t *prepare;
-  uv_check_t *check;
+  GuvPollerBackend *backend;
+  uv_timer_t *timer = NULL;
+  uv_prepare_t *prepare = NULL;
+  uv_check_t *check = NULL;
   int status;
 
-  g_return_val_if_fail (g_main_context_get_backend_funcs (context) == &guv_main_context_funcs, FALSE);
+  if (context == NULL)
+    context = g_main_context_default ();
 
-  if (!g_main_context_acquire (context))
-    return FALSE;
-
-  backend = g_main_context_get_backend_data (context);
-
-  if (G_UNLIKELY (backend->loop != NULL))
-    {
-      g_warning ("guv_main_context_start called again without an interceding guv_main_context_stop");
-      goto error_cleanup;
-    }
-
+  backend = g_slice_new0 (GuvPollerBackend);
+  backend->context = context;
   backend->loop = loop;
+  backend->poll_records = g_hash_table_new_full (g_direct_hash, g_direct_equal,
+      NULL, (GDestroyNotify) guv_poll_remove_record);
+  backend->dispatch_sources = TRUE;
 
   timer = g_slice_new (uv_timer_t);
-  status = uv_timer_init (loop, timer);
+  status = uv_timer_init (backend->loop, timer);
   if (G_UNLIKELY (status != 0))
     {
-      WARN_UV_LAST_ERROR("uv_timer_init failed", loop);
+      WARN_UV_LAST_ERROR("uv_timer_init failed", backend->loop);
       g_slice_free (uv_timer_t, timer);
-      goto error_cleanup;
+      goto fail;
     }
   timer->data = backend;
   backend->timer = timer;
 
   prepare = g_slice_new (uv_prepare_t);
-  status = uv_prepare_init (loop, prepare);
+  status = uv_prepare_init (backend->loop, prepare);
   if (G_UNLIKELY (status != 0))
     {
-      WARN_UV_LAST_ERROR("uv_prepare_init failed", loop);
+      WARN_UV_LAST_ERROR("uv_prepare_init failed", backend->loop);
       g_slice_free (uv_prepare_t, prepare);
-      goto error_cleanup;
+      goto fail;
     }
   prepare->data = backend;
   backend->prepare = prepare;
 
   check = g_slice_new (uv_check_t);
-  status = uv_check_init (loop, check);
+  status = uv_check_init (backend->loop, check);
   if (G_UNLIKELY (status != 0))
     {
-      WARN_UV_LAST_ERROR("uv_check_init failed", loop);
+      WARN_UV_LAST_ERROR("uv_check_init failed", backend->loop);
       g_slice_free (uv_check_t, check);
-      goto error_cleanup;
+      goto fail;
     }
   check->data = backend;
   backend->check = check;
@@ -420,136 +375,69 @@ guv_main_context_start (GMainContext *context, uv_loop_t *loop)
   status = uv_prepare_start (backend->prepare, guv_prepare_cb);
   if (G_UNLIKELY (status != 0))
     {
-      WARN_UV_LAST_ERROR("uv_prepare_start failed", loop);
-      goto error_cleanup;
+      WARN_UV_LAST_ERROR("uv_prepare_start failed", backend->loop);
+      goto fail;
     }
 
   status = uv_check_start (backend->check, guv_check_cb);
   if (G_UNLIKELY (status != 0))
     {
-      WARN_UV_LAST_ERROR("uv_check_start failed", loop);
-      goto error_cleanup;
+      WARN_UV_LAST_ERROR("uv_check_start failed", backend->loop);
+      goto fail;
     }
 
-  backend->thread = g_thread_ref (g_thread_self ());
+  return g_main_context_enter_poller (context, &guv_poller_funcs, backend);
 
-  g_hash_table_foreach (backend->poll_records, guv_poll_start_walk, loop);
-
-  return TRUE;
-
-error_cleanup:
-
+fail:
   if (backend->timer != NULL)
-    {
-      uv_close ((uv_handle_t *) backend->timer, guv_timer_closed);
-      backend->timer = NULL;
-    }
+    uv_close ((uv_handle_t *) backend->timer, guv_timer_closed);
   if (backend->prepare != NULL)
-    {
-      uv_close ((uv_handle_t *) backend->prepare, guv_prepare_closed);
-      backend->prepare = NULL;
-    }
+    uv_close ((uv_handle_t *) backend->prepare, guv_prepare_closed);
   if (backend->check != NULL)
-    {
-      uv_close ((uv_handle_t *) backend->check, guv_check_closed);
-      backend->check = NULL;
-    }
-  backend->loop = NULL;
-
-  g_main_context_release (context);
-
-  return FALSE;
+    uv_close ((uv_handle_t *) backend->check, guv_check_closed);
+  g_slice_free (GuvPollerBackend, backend);
+  return NULL;
 }
 
-void guv_main_context_stop (GMainContext *context)
+static void
+guv_poller_destroy (gpointer backend_data)
 {
-  GUvLoopBackend *backend;
+  GuvPollerBackend *backend = backend_data;
 
-  g_return_if_fail (g_main_context_get_backend_funcs (context) == &guv_main_context_funcs);
-
-  backend = g_main_context_get_backend_data (context);
-
-  g_return_if_fail (backend->loop != NULL);
-
-  g_hash_table_foreach (backend->poll_records, guv_poll_stop_walk, backend->loop);
+  g_hash_table_foreach (backend->poll_records, guv_poll_stop_walk,
+                        backend->loop);
+  g_hash_table_destroy (backend->poll_records);
 
   uv_close ((uv_handle_t *) backend->timer, guv_timer_closed);
-  backend->timer = NULL;
   uv_close ((uv_handle_t *) backend->prepare, guv_prepare_closed);
-  backend->prepare = NULL;
   uv_close ((uv_handle_t *) backend->check, guv_check_closed);
-  backend->check = NULL;
-
-  backend->loop = NULL;
-
-  g_thread_unref (backend->thread);
-  backend->thread = NULL;
-
-  g_main_context_release (context);
-}
-
-static gpointer guv_context_create (gpointer user_data)
-{
-  GUvLoopBackend *backend;
-  int status;
-
-  backend = g_slice_new0 (GUvLoopBackend);
-
-  backend->poll_records = g_hash_table_new_full (g_direct_hash, g_direct_equal,
-      NULL, (GDestroyNotify) guv_poll_remove_record);
-
-  backend->dispatch_sources = TRUE;
-
-  return backend;
-}
-
-static void
-guv_context_set_context (gpointer backend_data,
-                         GMainContext *context)
-{
-  GUvLoopBackend *backend = backend_data;
-  backend->context = context;
-}
-
-static void
-guv_context_free (gpointer backend_data)
-{
-  GUvLoopBackend *backend = backend_data;
-
-  if (backend->loop != NULL)
-    {
-      g_critical ("guv_main_context_stop is never called, handles leaked");
-      g_thread_unref (backend->thread);
-    }
-
-  g_hash_table_destroy (backend->poll_records);
 
   g_free (backend->fds);
 
-  g_slice_free (GUvLoopBackend, backend);
+  g_slice_free (GuvPollerBackend, backend);
+}
+
+static void
+guv_poller_reset (gpointer backend_data)
+{
+  GuvPollerBackend *backend = backend_data;
+
+  g_hash_table_foreach (backend->poll_records, guv_poll_stop_walk,
+                        backend->loop);
+  g_hash_table_remove_all (backend->poll_records);
+
+  uv_timer_stop (backend->timer);
 }
 
 static gboolean
-guv_context_acquire (gpointer backend_data)
+guv_poller_iterate (gpointer      backend_data,
+                    GMainContext *context,
+                    gboolean      block,
+                    gboolean      dispatch)
 {
-  GUvLoopBackend *backend = backend_data;
+  GuvPollerBackend *backend = backend_data;
 
-  return backend->thread == NULL || backend->thread == g_thread_self ();
-}
-
-static gboolean
-guv_context_iterate (gpointer backend_data,
-                     gboolean block,
-                     gboolean dispatch)
-{
-  GUvLoopBackend *backend = backend_data;
-
-  if (G_UNLIKELY (backend->loop == NULL))
-    {
-      if (block)
-        g_error ("can't block for events without guv_main_context_start");
-      return FALSE;
-    }
+  g_assert (context == backend->context);
 
   backend->sources_ready = FALSE;
   backend->dispatch_sources = dispatch;
@@ -562,13 +450,13 @@ guv_context_iterate (gpointer backend_data,
 }
 
 static gboolean
-guv_context_add_fd (gpointer backend_data,
-                    gint     fd,
-                    gushort  events,
-                    gint     priority)
+guv_poller_add_fd (gpointer backend_data,
+                   gint     fd,
+                   gushort  events,
+                   gint     priority)
 {
-  GUvLoopBackend *backend = backend_data;
-  GUvPollData *pd;
+  GuvPollerBackend *backend = backend_data;
+  GuvPollData *pd;
 
   pd = guv_poll_new (fd, events, backend);
 
@@ -576,45 +464,40 @@ guv_context_add_fd (gpointer backend_data,
 
   pd->gc_flags |= GUV_POLL_IN_CONTEXT;
 
-  if (backend->loop != NULL)
-    guv_poll_start (pd, backend->loop);
+  guv_poll_start (pd, backend->loop);
 
   return TRUE;
 }
 
 static gboolean
-guv_context_remove_fd (gpointer backend_data,
-                       gint     fd)
+guv_poller_remove_fd (gpointer backend_data,
+                      gint     fd)
 {
-  GUvLoopBackend *backend = backend_data;
-  GUvPollData *pd;
-  gint status;
+  GuvPollerBackend *backend = backend_data;
+  GuvPollData *pd;
 
   pd = g_hash_table_lookup (backend->poll_records, GINT_TO_POINTER (fd));
   g_return_val_if_fail (pd != NULL, FALSE);
 
-  if (backend->loop != NULL)
-    guv_poll_stop (pd, backend->loop);
+  guv_poll_stop (pd, backend->loop);
 
   return g_hash_table_remove (backend->poll_records, GINT_TO_POINTER (fd));
 }
 
 static gboolean
-guv_context_modify_fd   (gpointer backend_data,
-                         gint     fd,
-                         gushort  events,
-                         gint     priority)
+guv_poller_modify_fd (gpointer backend_data,
+                      gint     fd,
+                      gushort  events,
+                      gint     priority)
 {
-  GUvLoopBackend *backend = backend_data;
-  GUvPollData *pd;
-  int status;
+  GuvPollerBackend *backend = backend_data;
+  GuvPollData *pd;
 
   pd = g_hash_table_lookup (backend->poll_records, GINT_TO_POINTER (fd));
 
   g_return_val_if_fail (pd != NULL, FALSE);
 
-  if (backend->loop != NULL)
-    guv_poll_update (pd, events, backend->loop);
+  guv_poll_update (pd, events, backend->loop);
 
   return TRUE;
 }
