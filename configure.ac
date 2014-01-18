@@ -11,7 +11,7 @@ PKG_CHECK_MODULES([UV], [libuv])
 CPPFLAGS_save=$CPPFLAGS
 CPPFLAGS="$CPPFLAGS $GLIB_CFLAGS"
 
-AC_CHECK_DECL([g_main_context_enter_poller],
+AC_CHECK_DECL([g_main_loop_new_with_poller],
   [],[AC_MSG_ERROR([GLib poller support is required])],
   [#include <glib.h>])
 

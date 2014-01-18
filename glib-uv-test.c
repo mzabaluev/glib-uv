@@ -48,25 +48,30 @@ GSourceFuncs funcs = {
 };
 
 static void
-test_uvcontext_basic (void)
+test_mainloop_basic (void)
 {
-  uv_loop_t *loop;
+  uv_loop_t *uv_loop;
+  GMainLoop *loop;
   GMainContext *ctx;
-  gpointer poller;
 
-  ctx = g_main_context_new ();
-  loop = uv_loop_new ();
+  uv_loop = uv_loop_new ();
+  loop = guv_main_loop_new (NULL, uv_loop);
 
-  poller = guv_main_context_start (ctx, loop);
+  g_assert (!g_main_loop_is_running (loop));
+
+  ctx = g_main_loop_get_context (loop);
+  g_assert (ctx == g_main_context_default ());
+
+  g_assert_cmpint (g_main_depth (), ==, 0);
 
   g_assert (!g_main_context_pending (ctx));
   g_assert (!g_main_context_iteration (ctx, FALSE));
 
-  g_main_context_leave_poller (ctx, poller);
-  g_main_context_unref (ctx);
+  g_main_loop_unref (loop);
 
-  uv_run (loop, UV_RUN_DEFAULT);
-  uv_loop_delete (loop);
+  uv_run (uv_loop, UV_RUN_DEFAULT);
+
+  uv_loop_delete (uv_loop);
 }
 
 static gint a;
@@ -83,34 +88,20 @@ count_calls (gpointer data)
   return TRUE;
 }
 
-typedef struct _StopContextData
-{
-  GMainContext *context;
-  gpointer      poller;
-} StopContextData;
-
-static gboolean
-stop_context (gpointer data)
-{
-  StopContextData *d = data;
-  g_main_context_leave_poller (d->context, d->poller);
-  return G_SOURCE_REMOVE;
-}
-
 static void
 test_timeouts (void)
 {
-  uv_loop_t *loop;
+  uv_loop_t *uv_loop;
   GMainContext *ctx;
+  GMainLoop *loop;
   GSource *source;
-  StopContextData leave_data;
+  gboolean loop_started;
 
   a = b = c = 0;
 
   ctx = g_main_context_new ();
-  loop = uv_loop_new ();
-  leave_data.context = ctx;
-  leave_data.poller = guv_main_context_start (ctx, loop);
+  uv_loop = uv_loop_new ();
+  loop = guv_main_loop_new (ctx, uv_loop);
 
   source = g_timeout_source_new (100);
   g_source_set_callback (source, count_calls, &a, NULL);
@@ -128,11 +119,15 @@ test_timeouts (void)
   g_source_unref (source);
 
   source = g_timeout_source_new (1050);
-  g_source_set_callback (source, stop_context, &leave_data, NULL);
+  g_source_set_callback (source, (GSourceFunc)g_main_loop_quit, loop, NULL);
   g_source_attach (source, ctx);
   g_source_unref (source);
 
-  uv_run (loop, UV_RUN_DEFAULT);
+  loop_started = g_main_loop_start (loop);
+
+  g_assert (loop_started);
+
+  uv_run (uv_loop, UV_RUN_DEFAULT);
 
   /* We may be delayed for an arbitrary amount of time - for example,
    * it's possible for all timeouts to fire exactly once.
@@ -145,8 +140,19 @@ test_timeouts (void)
   g_assert_cmpint (b, <=, 4);
   g_assert_cmpint (c, <=, 3);
 
-  uv_loop_delete (loop);
+  g_main_loop_unref (loop);
+  uv_loop_delete (uv_loop);
   g_main_context_unref (ctx);
+}
+
+static gboolean
+quit_loop (gpointer data)
+{
+  GMainLoop *loop = data;
+
+  g_main_loop_quit (loop);
+
+  return G_SOURCE_REMOVE;
 }
 
 static gint count;
@@ -170,15 +176,15 @@ static gpointer
 thread_func (gpointer data)
 {
   GMainContext *ctx = data;
-  uv_loop_t *loop;
+  uv_loop_t *uv_loop;
+  GMainLoop *loop;
   GSource *source;
-  StopContextData leave_data;
+  gboolean loop_started;
 
   g_main_context_push_thread_default (ctx);
 
-  loop = uv_loop_new ();
-  leave_data.context = ctx;
-  leave_data.poller = guv_main_context_start (ctx, loop);
+  uv_loop = uv_loop_new ();
+  loop = guv_main_loop_new (ctx, uv_loop);
 
   g_mutex_lock (&mutex);
   thread_ready = TRUE;
@@ -186,12 +192,18 @@ thread_func (gpointer data)
   g_mutex_unlock (&mutex);
 
   source = g_timeout_source_new (500);
-  g_source_set_callback (source, stop_context, &leave_data, NULL);
+  g_source_set_callback (source, quit_loop, loop, NULL);
   g_source_attach (source, ctx);
   g_source_unref (source);
 
-  uv_run (loop, UV_RUN_DEFAULT);
-  uv_loop_delete (loop);
+  loop_started = g_main_loop_start (loop);
+
+  g_assert (loop_started);
+
+  uv_run (uv_loop, UV_RUN_DEFAULT);
+
+  g_main_loop_unref (loop);
+  uv_loop_delete (uv_loop);
 
   g_main_context_pop_thread_default (ctx);
 
@@ -227,14 +239,45 @@ test_invoke (void)
   g_main_context_unref (ctx);
 }
 
+static gboolean
+quit_loop_and_unref (gpointer data)
+{
+  GMainLoop *loop = data;
+
+  g_main_loop_quit (loop);
+  g_main_loop_unref (loop);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+test_unref_mainloop (void)
+{
+  uv_loop_t *uv_loop;
+  GMainLoop *loop;
+  gboolean loop_started;
+
+  uv_loop = uv_loop_new ();
+  loop = guv_main_loop_new (NULL, uv_loop);
+  g_idle_add (quit_loop_and_unref, loop);
+
+  loop_started = g_main_loop_start (loop);
+
+  g_assert (loop_started);
+
+  uv_run (uv_loop, UV_RUN_DEFAULT);
+  uv_loop_delete (uv_loop);
+}
+
 int
 main (int argc, char *argv[])
 {
   g_test_init (&argc, &argv, NULL);
 
-  g_test_add_func ("/basic", test_uvcontext_basic);
+  g_test_add_func ("/basic", test_mainloop_basic);
   g_test_add_func ("/timeouts", test_timeouts);
   g_test_add_func ("/invoke", test_invoke);
+  g_test_add_func ("/unref-mainloop", test_unref_mainloop);
 
   return g_test_run ();
 }
